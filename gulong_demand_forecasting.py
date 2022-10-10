@@ -22,19 +22,19 @@ import streamlit as st
 # Modelling and Forecasting
 # =============================================================================
 from prophet import Prophet
-
+from prophet.plot import plot_plotly, plot_components_plotly
+from prophet.utilities import regressor_coefficients
 # Customer transaction behavior
 from lifetimes.fitters.pareto_nbd_fitter import ParetoNBDFitter
 # from lifetimes import GammaGammaFitter
-from prophet.utilities import regressor_coefficients
-import plotly.express as px
-from prophet.plot import plot_plotly, plot_components_plotly
 from pytrends.request import TrendReq
+import plotly.express as px
+import plotly.graph_objects as go
 
 # Machine Learning libraries
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error, r2_score
 
-import plotly.graph_objects as go
+
 import warnings
 warnings.filterwarnings(action='ignore', category=UserWarning)
 from joblib import dump, load
@@ -331,7 +331,7 @@ def get_rfm_2(df, start_date = None, end_date = None):
     temp_df['total_sales'] = temp_df.apply(lambda x: df[df.date==x['date']]['total_sales'].values.sum() if x['date'] in df.date.dt.date.array else 0, 1)
     return temp_df
     
-@st.experimental_memo
+@st.experimental_singleton
 def fit_models(df, penalizer = 0.001):
     '''
     Fit Pareto/NBD model to transaction data
@@ -531,91 +531,128 @@ def convert_csv(df):
     # IMPORTANT: Cache the conversion to prevent recomputation on every rerun.
     return df.to_csv().encode('utf-8')
 
+def remove_neg_val(yhat, yhat_lower, yhat_upper):
+    yhat = yhat if yhat > 0 else 0
+    yhat_lower = yhat_lower if yhat_lower > 0 else 0
+    yhat_upper = yhat_upper if yhat_upper > 0 else 0
+    return yhat, yhat_lower, yhat_upper
+
 
 if __name__ == "__main__":
     # 1. import datasets
+    st.sidebar.markdown('# 2. Data Preparation')
     with st.sidebar.expander("Data Selection"):
         # choose platform for data import
-        platform = st.selectbox("Platform",
-                                options=["Gulong.ph", "Mechanigo.ph"],
-                                index=0,
-                                help = tooltips_text['platform_select'])
-        df_traffic, df_txns = import_cleanup_df(platform)
+        # platform = st.selectbox("Platform",
+        #                         options=["Gulong.ph", "Mechanigo.ph"],
+        #                         index=0,
+        #                         help = tooltips_text['platform_select'])
+        df_traffic, df_txns = import_cleanup_df("Gulong.ph")
         
         # date column
         date_col = st.selectbox('Date column', df_traffic.columns[df_traffic.dtypes=='datetime64[ns]'],
                                 index=0,
                                 help = tooltips_text['date_column'])
         
-        platform_data = {'Gulong.ph': ('quantity', 'sessions', 'purchases_backend_website'),
-                 'Mechanigo.ph': ('sessions', 'bookings_ga')}
+        # platform_data = {'Gulong.ph': ('quantity', 'sessions', 'purchases_backend_website'),
+        #          'Mechanigo.ph': ('sessions', 'bookings_ga')}
         # target column
-        param = st.selectbox('Target column:', platform_data[platform],
-                                index=0,
-                                help = tooltips_text['target_column'])
+        # param = st.selectbox('Target column:', platform_data[platform],
+        #                         index=0,
+        #                         help = tooltips_text['target_column'])
+        param = "total_qty"
         
         filter_by = st.selectbox("Group data by",
                                  options = ["model", "make", "dimensions"],
                                  index = 0,
                                  help = tooltips_text['group_data'])
         
-        # select observation period parameters
-        # observation period type
-        # observation period
-        # st.write('### Observation period')
-        # obs_period_type = st.selectbox('Type of observation period duration',
-        #                             options=['date', 'days'],
-        #                             index = 0,
-        #                             help = tooltips_text['obs_period_type'])
+        # 2. filter data sets
+    with st.sidebar.expander('Filtering'):
         
-        # if obs_period_type == 'date':
-        #     obs_start_date = st.date_input('Start date of observation period until date today.',
-        #                               min_value = dt.datetime.today().date()-dt.timedelta(days=180),
-        #                               max_value = dt.datetime.today().date(),
-        #                               value = dt.datetime.today().date()-dt.timedelta(days=30),
-        #                               help = tooltips_text['obs_start_date'])
-        #     obs_period = pd.date_range(start=obs_start_date, end = dt.datetime.today().date())
+        # filter by following parameters
+        # minimum number of transactions in dataset according to grouping
+        min_num_txns = st.number_input(label="Min. number of transactions",
+                        min_value = 5,
+                        value = 10,
+                        help = tooltips_text['min_num_trans'])
         
-        # elif obs_period_type == 'days':
-        #     obs_start_days = st.slider('Number of days in observation period to date today.',
-        #                                 min_value = 0,
-        #                                 max_value = 180, 
-        #                                 value = 30,
-        #                                 help = tooltips_text['obs_start_day'])
-        #     obs_period = pd.date_range(start=dt.datetime.today().date - dt.timedelta(days=obs_start_days), 
-        #                                end = dt.datetime.today().date())
-            
-        # display observation period
-        # st.markdown(f'''Observation period: \n 
-        #             {obs_period.min().date()} to {obs_period.max().date()}''')
+        # Transaction date cutoff
+        max_date = st.date_input(label = "Last transaction date cutoff",
+                                 min_value = df_txns['date'].min().date(),
+                                 value = pd.to_datetime('2022-03-01'),
+                                 help = tooltips_text['date_cutoff'])
         
-        # select calibration period parameters
-        # calibration period 
-        # calibration period start
+        # filter models by number of transactions & availability
+        data_agg = df_txns.groupby(filter_by) \
+                                .agg(min_date=("date", lambda x: x.min().date()),
+                                     max_date=("date", lambda x: x.max().date()),
+                                     num_txns = ("date", lambda x: len(x))) \
+                                .sort_values('num_txns', ascending=False)
         
-         # select data
+        # candidate groups after filtering
+        select_groups = list(data_agg[(data_agg.num_txns >= min_num_txns) \
+                                      & (data_agg.max_date >= max_date)] \
+                                .sort_values('num_txns', ascending=False).index)
+        
+        st.info(f'''Found **{len(select_groups)}** groups.''')
+        
+        group_selected = st.selectbox(label='Select item to forecast',
+                         options=select_groups,
+                         index = 0,
+                         help = tooltips_text['group_select'])
+        
+        
+        # fit pnbd model on all dataset
+        # should only run once (st.experimental_memo)
+        pnbd_model = fit_models(get_rfm_2(get_agg_data(df_txns)))
+        
+        # 3. Create RFM dataframe
+        # Use all filtered data for fitting pareto model
+        sku_dict = {}
+        # groupby date + calc agg data + pareto results
+        temp = df_txns[df_txns[filter_by] == group_selected] \
+                                .sort_values('date', ascending=True).reset_index()
+        
+        # generate time series df of only transaction dates
+        sku_list = []
+        # date not yet restricted to properly get freq, recency, last_txn, ITT
+        temp_data = get_rfm_2(get_agg_data(temp))
+        
+        # 4. Apply Pareto NBD model on calib and obs data
+        # sku_dict[item]['pareto_model'] = fit_models(sku_dict[item]['calib'])
+        # t = 1 to only predict up to 1 day
+        sku_dict[group_selected] = lifetimes_stats(_pnbd = pnbd_model, 
+                                             t = 1, 
+                                            df = temp_data)
+        
+    with st.sidebar.expander("Training and Forecast Dataset"):
         st.markdown('### Training dataset')
         tcol1, tcol2 = st.columns(2)
         with tcol1:
             calib_period_start = st.date_input('Training data start date',
                                         value = pd.to_datetime('2022-03-01'),
-                                        min_value=df_traffic.date.min().date(),
-                                        max_value=df_traffic.date.max().date()-timedelta(days=60),
+                                        min_value=sku_dict[group_selected].date.min().date(),
+                                        max_value=sku_dict[group_selected].date.max().date()-timedelta(days=30),
                                         help = tooltips_text['training_start'])
         with tcol2:
             calib_period_end = st.date_input('Training data end date',
-                                        value = df_traffic.date.max().date() - timedelta(days=15),
+                                        value = df_traffic.date.max().date(),
                                         min_value= calib_period_start + timedelta(days=30),
-                                        max_value=dt.datetime.today().date(),
+                                        max_value= df_traffic.date.max().date(),
                                         help = tooltips_text['training_end'])
         if calib_period_start >= calib_period_end:
             st.error('Train_end should come after train_start.')
         
         if pd.Timestamp(calib_period_start) <= df_traffic.date.max():
             date_series = make_forecast_dataframe(calib_period_start, calib_period_end)
-            param_series = df_txns[df_txns.date.isin(date_series.ds.values)][param].reset_index()
-            evals = pd.concat([date_series, param_series], axis=1).rename(columns={0: 'ds',
-                                                                                   param:'y'}).drop('index', axis=1)
+            param_series =  sku_dict[group_selected][sku_dict[group_selected] \
+                                                     .date.isin(date_series.ds.values)]['total_qty'] \
+                                                     .reset_index()
+            evals = pd.concat([date_series, param_series], axis=1) \
+                                                     .rename(columns={0: 'ds', 
+                                                                      param:'y'}) \
+                                                     .drop('index', axis=1)
             # check for NaNs
             if evals.y.isnull().sum() > 0.5*len(evals):
                 st.warning('Evals data contains too many NaN values')
@@ -623,18 +660,11 @@ if __name__ == "__main__":
         else:
             st.error('val_end is outside available dataset.')
         
-        # calib_period_end = pd.to_datetime(obs_period.min().date() - dt.timedelta(days=1)).date()
-        # calib_period_start = st.date_input('Start of calibration period',
-        #                                    min_value = df_txns.date.min().date(),
-        #                                    max_value = calib_period_end - dt.timedelta(days=30),
-        #                                    value = df_txns.date.min().date(),
-        #                                    help = tooltips_text['calib_period_start'])
-        
         # show calibration period
-        st.markdown(f'''Calibration period: \n 
+        st.markdown(f'''Training period: \n 
                     {calib_period_start} to {calib_period_end}''')
-    
-    with st.sidebar.expander('Forecast'):
+        
+        st.markdown('### Forecast dataset')
         make_forecast_future = st.checkbox('Make forecast on future dates',
                                            value = True,
                                            help = tooltips_text['forecast_checkbox'])
@@ -649,101 +679,15 @@ if __name__ == "__main__":
                                              end=forecast_end)
             st.info(f'''Forecast dates:\n 
                     {calib_period_end+timedelta(days=1)} to {forecast_end}''')
-    
-    # 2. filter data sets
-    with st.sidebar.expander('Filtering'):
         
-        # filter by following parameters
-        # minimum number of transactions in dataset according to grouping
-        min_num_txns = st.number_input(label="Min. number of transactions",
-                        min_value = 5,
-                        value = 10,
-                        help = tooltips_text['min_num_trans'])
-        
-        # Transaction date cutoff
-        max_date = st.date_input(label = "Last transaction date cutoff",
-                                 min_value = df_txns['date'].min().date(),
-                                 value = pd.to_datetime('2022-01-01'),
-                                 help = tooltips_text['date_cutoff'])
-        
-        # filter models by number of transactions & availability
-        data_agg = df_txns.groupby(filter_by) \
-                                .agg(min_date=("date", lambda x: x.min().date()),
-                                     max_date=("date", lambda x: x.max().date()),
-                                     num_txns = ("date", lambda x: len(x))) \
-                                .sort_values('num_txns', ascending=False)
-        
-        select_groups = sorted(list(data_agg[(data_agg.num_txns >= min_num_txns) \
-                                      & (data_agg.max_date >= max_date)].index))
-        
-        st.markdown(f'''Found **{len(select_groups)}** groups.''')
-        
-        group_select = st.multiselect(label='Select group to forecast',
-                         options=select_groups,
-                         default=select_groups[0],
-                         help = tooltips_text['group_select'])
-        
-        pnbd_model = fit_models(get_rfm_2(get_agg_data(df_txns), 
-                               start_date=calib_period_start,
-                               end_date=calib_period_end))
-        
-        
-    # 3. Create RFM dataframe
-    # Use all filtered data for fitting pareto model
-        sku_dict = {}
-        for item in group_select:
-            # groupby date + calc agg data + pareto results
-            temp = df_txns[df_txns[filter_by] == item].sort_values('date', ascending=True).reset_index()
-            
-            # generate time series df of only transaction dates
-            sku_list = []
-            for row in range(1, len(temp)):
-                #sku_list.append(get_agg_data(temp.iloc[:row, :]))
-            
-                temp_data = get_rfm_2(get_agg_data(temp), 
-                                    start_date = calib_period_start,
-                                    end_date = dt.datetime.today().date())
-                
-                # build calib and obs data for each group
-                sku_dict[item] = {'calib': temp_data[(temp_data.date.dt.date >= calib_period_start) 
-                                                             & (temp_data.date.dt.date <= calib_period_end)],
-                                  'forecast': temp_data[(temp_data.date.dt.date > calib_period_end) 
-                                                   & (temp_data.date.dt.date <= df_traffic.date.max().date())]}
-            
-                # 4. Apply Pareto NBD model on calib and obs data
-                # sku_dict[item]['pareto_model'] = fit_models(sku_dict[item]['calib'])
-                sku_dict[item]['pareto_model'] = pnbd_model
-                sku_dict[item]['calib'] = lifetimes_stats(_pnbd = sku_dict[item]['pareto_model'], 
-                                                              t = 1, 
-                                                              df = sku_dict[item]['calib'])
-                sku_dict[item]['forecast'] = lifetimes_stats(_pnbd = sku_dict[item]['pareto_model'], 
-                                                              t = 1, 
-                                                              df = sku_dict[item]['forecast'])
-            
+
     # 5. Use FB Prophet model to RFM dataset
     # MODELLING
     # ========================================================================
     st.sidebar.markdown('# 2. Modelling')
     # default parameters for target cols
-    default_params = {'sessions':{'growth': 'logistic',
-              'seasonality_mode': 'multiplicative',
-              'changepoint_prior_scale': 8.0,
-              'n_changepoints' : 30,
-              'cap' : 2500.0,
-              },
-              'purchases_backend_website':{'growth': 'logistic',
-              'seasonality_mode': 'multiplicative',
-              'changepoint_prior_scale': 8.0,
-              'n_changepoints' : 30,
-              'cap' : 30.0,
-              },
-              'bookings_ga':{'growth': 'logistic',
-              'seasonality_mode': 'multiplicative',
-              'changepoint_prior_scale': 8.0,
-              'n_changepoints' : 30,
-              'cap' : 30.0,
-              },
-              'total_quantity':{'growth': 'logistic',
+    default_params = {
+              'total_qty':{'growth': 'logistic',
               'seasonality_mode': 'multiplicative',
               'changepoint_prior_scale': 8.0,
               'n_changepoints' : 30,
@@ -766,7 +710,7 @@ if __name__ == "__main__":
             cap = st.number_input('Fixed cap value',
                                   min_value = 0.0,
                                   max_value = None,
-                                  value = np.ceil(max(df_traffic[param])/500)*500,
+                                  value = np.ceil(max(sku_dict[group_selected][param])/500)*500,
                                   step = 0.01,
                                   help = tooltips_text['cap_value'])
             evals.loc[:, 'cap'] = cap
@@ -850,9 +794,7 @@ if __name__ == "__main__":
                             key = 'season_model',
                             help = tooltips_text['add_seasonality'])
         
-        seasonality_scale_dict = {'sessions': 6,
-                                  'purchases_backend_website': 3,
-                                  'bookings_ga': 3}
+        seasonality_scale_dict = {}
         
         if season_model == 'True':
             model.daily_seasonality = 'auto'
@@ -871,11 +813,11 @@ if __name__ == "__main__":
                 seasonality_prior_scale = st.number_input('overall_seasonality_prior_scale',
                                                       min_value= 0.01,
                                                       max_value= 50.0,
-                                                      value=float(seasonality_scale_dict[param]),
+                                                      value=6.0,
                                                       step = 0.1,
                                                       help = tooltips_text['overall_seasonality_prior_scale'])
             else:
-                seasonality_prior_scale = 1
+                seasonality_prior_scale = 1.0
                 
             model.seasonality_prior_scale = seasonality_prior_scale
             
@@ -1001,14 +943,12 @@ if __name__ == "__main__":
                 
                 model.holidays = pd.concat([holidays_set[h] for h in selected_holidays])
             
-            holiday_scale_dict = {'sessions': 3,
-                                  'purchases_backend_website': 3,
-                                  'bookings_ga': 3}
+            holiday_scale_dict = {}
             
             holiday_scale = st.number_input('holiday_prior_scale',
                                             min_value = 1.0,
                                             max_value = 30.0,
-                                            value = float(holiday_scale_dict[param]),
+                                            value = float(3),
                                             step = 1.0,
                                             help = tooltips_text['holiday_prior_scale'])
             # set holiday prior scale
@@ -1060,13 +1000,7 @@ if __name__ == "__main__":
                                   value = True,
                                   help = tooltips_text['add_metrics'])
         
-        exog_num_cols = {'sessions': ['ctr_fb', 'ctr_ga', 'ctr_total', 'ad_costs_fb_total', 'ad_costs_ga', 'ad_costs_total',
-                             'landing_page_views', 'impressions_fb', 'impressions_ga', 'pageviews'],
-                         'purchases_backend_website': ['ctr_fb', 'ctr_ga', 'ctr_total', 'ad_costs_fb_total', 'ad_costs_ga', 'ad_costs_total',
-                             'landing_page_views', 'impressions_fb', 'impressions_ga', 'cancellations',
-                             'rejections'],
-                         'bookings_ga': ['ctr_ga', 'ad_costs_ga', 'impressions_ga'],
-                         'total_quantity': ['sessions', 'ad_costs_total', 'ctr_total']}
+        exog_num_cols = {'total_qty': ['sessions', 'ad_costs_total', 'ctr_total']}
         
         regressors = list()
         metrics_container = st.empty()
@@ -1074,21 +1008,38 @@ if __name__ == "__main__":
             # Select traffic metrics available from data.
             
             with metrics_container.container():
-                exogs = st.multiselect('Select data metrics',
+                traffic_exogs = st.multiselect('Select traffic data metrics',
                                options = exog_num_cols[param],
-                               default = ['ctr_total', 'ad_costs_total'],
+                               default = exog_num_cols[param],
                                help = tooltips_text['add_metrics_select'])
                 
-                # add selected exogenous variables to list of regressors
-                regressors.extend(exogs)
-                for exog in exogs:
-                    evals.loc[:, exog] = df_traffic[df_traffic.date.isin(evals.ds)][exog].values
-                    model.add_regressor(exog)
+                regressors.extend(traffic_exogs)
+                
+                
+                for traffic_exog in traffic_exogs:
+                    evals.loc[:, traffic_exog] = df_traffic[df_traffic.date.isin(evals.ds)][traffic_exog].values
+                    model.add_regressor(traffic_exog)
+                    
+                    # if forecast future
+                    if make_forecast_future:
+                        future.loc[future.ds.isin(evals.ds), traffic_exog] = df_traffic[df_traffic.date.isin(evals.ds)][traffic_exog].values
+                
+                
+                txns_exogs = st.multiselect('Select transaction data metrics',
+                               options = list(sku_dict[group_selected].columns.drop(labels = ['date', 'total_qty'])),
+                               default = list(sku_dict[group_selected].columns.drop(labels = ['date', 'total_qty'])),
+                               help = tooltips_text['add_metrics_select'])
+                
+                regressors.extend(txns_exogs)
+                
+                for txns_exog in txns_exogs:
+                    evals.loc[:, txns_exog] = sku_dict[group_selected][sku_dict[group_selected].date.isin(evals.ds)][txns_exog].values
+                    model.add_regressor(txns_exog)
                 
                     
                     # if forecast future
                     if make_forecast_future:
-                        future.loc[future.ds.isin(evals.ds), exog] = df_traffic[df_traffic.date.isin(evals.ds)][exog].values
+                        future.loc[future.ds.isin(evals.ds), txns_exog] = sku_dict[group_selected][sku_dict[group_selected].date.isin(evals.ds)][txns_exog].values
         
         # gtrends
         add_gtrends = st.checkbox('Add Google trends',
@@ -1126,7 +1077,9 @@ if __name__ == "__main__":
                     for regressor in regressors:
                         if regressor in df_traffic.columns:
                             exog_data = df_traffic[df_traffic.date.isin(date_series.ds.values)][regressor]
-                        else:
+                        elif regressor in sku_dict[group_selected].columns:
+                            exog_data = sku_dict[group_selected][sku_dict[group_selected].date.isin(evals.ds)][regressor]
+                        if add_gtrends and len(kw_list) > 0:
                             exog_data = gtrends[regressor]
                         # added key to solve DuplicateWidgetID
                         data_input = st.selectbox(regressor + ' data input type:',
@@ -1186,19 +1139,17 @@ if __name__ == "__main__":
             else:
                 custom_reg_container.empty()
                 
-        # OUTLIERS
-        # =====================================================================
-        st.write('Outliers')
+    # OUTLIERS
+    # =====================================================================
+    with st.sidebar.expander('Outliers'):
         remove_outliers = st.checkbox('Remove outliers', value = False,
                                       help = tooltips_text['outliers'])
         if remove_outliers:
             # option to remove datapoints with value = 0
-            remove_zeros = st.checkbox('Remove zero datapoints', 
-                                       value = False)
-            if remove_zeros:
-                evals = evals[evals.y != 0]
-                if make_forecast_future:
-                    future = future[future.y != 0]
+            remove_neg = st.checkbox('Remove negative datapoints', 
+                                       value = True)
+            if remove_neg:
+                evals = evals.apply(lambda x: x['y'] if x['y'] > 0 else 0, axis=1)
     
     start_forecast = st.sidebar.checkbox('Launch forecast',
                                  value = False)     
@@ -1223,6 +1174,11 @@ if __name__ == "__main__":
             #st.dataframe(evals)
             forecast = model.predict(evals)
         
+        if remove_neg:
+            forecast = forecast.apply(lambda x: remove_neg_val(x['yhat'], x['yhat_lower'], x['yhat_upper']), axis=1)
+        else:
+            pass
+
 
         # plot
         st.header('Overview')
