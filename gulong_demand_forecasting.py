@@ -531,11 +531,9 @@ def convert_csv(df):
     # IMPORTANT: Cache the conversion to prevent recomputation on every rerun.
     return df.to_csv().encode('utf-8')
 
-def remove_neg_val(yhat, yhat_lower, yhat_upper):
-    yhat = yhat if yhat > 0 else 0
-    yhat_lower = yhat_lower if yhat_lower > 0 else 0
-    yhat_upper = yhat_upper if yhat_upper > 0 else 0
-    return yhat, yhat_lower, yhat_upper
+def remove_neg_val(val):
+    val = val if val > 0 else 0
+    return val
 
 
 if __name__ == "__main__":
@@ -1191,7 +1189,9 @@ if __name__ == "__main__":
             forecast = model.predict(evals)
         
         if remove_neg:
-            forecast = forecast.apply(lambda x: remove_neg_val(x['yhat'], x['yhat_lower'], x['yhat_upper']), axis=1)
+            forecast['yhat'] = forecast.apply(lambda x: remove_neg_val(x['yhat']), axis=1)
+            forecast['yhat_lower'] = forecast.apply(lambda x: remove_neg_val(x['yhat_lower']), axis=1)
+            forecast['yhat_upper'] = forecast.apply(lambda x: remove_neg_val(x['yhat_upper']), axis=1)
         else:
             pass
 
@@ -1199,6 +1199,7 @@ if __name__ == "__main__":
         # plot
         st.header('Overview')
         st.markdown(tooltips_text['overview'])
+        # add ITT lines in plot
         st.plotly_chart(plot_plotly(model, forecast,
                                     uncertainty=True,
                                     changepoints=True,
