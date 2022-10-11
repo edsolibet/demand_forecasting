@@ -328,7 +328,7 @@ def get_rfm_2(df, start_date = None, end_date = None):
     
     # total_qty
     temp_df['total_qty'] = temp_df.apply(lambda x: df[df.date==x['date']]['total_qty'].values.sum() if x['date'] in df.date.dt.date.array else 0, 1)
-    temp_df['total_sales'] = temp_df.apply(lambda x: df[df.date==x['date']]['total_sales'].values.sum() if x['date'] in df.date.dt.date.array else 0, 1)
+    #temp_df['total_sales'] = temp_df.apply(lambda x: df[df.date==x['date']]['total_sales'].values.sum() if x['date'] in df.date.dt.date.array else 0, 1)
     return temp_df
     
 @st.experimental_singleton
@@ -540,7 +540,7 @@ def remove_neg_val(yhat, yhat_lower, yhat_upper):
 
 if __name__ == "__main__":
     # 1. import datasets
-    st.sidebar.markdown('# 2. Data Preparation')
+    st.sidebar.markdown('# 1. Data Preparation')
     with st.sidebar.expander("Data Selection"):
         # choose platform for data import
         # platform = st.selectbox("Platform",
@@ -601,7 +601,25 @@ if __name__ == "__main__":
                          options=select_groups,
                          index = 0,
                          help = tooltips_text['group_select'])
+        #group_selected = 'MICHELIN 265/65/R17 PRIMACY SUV 112H'
         
+    with st.sidebar.expander("Training and Forecast Dataset"):
+        st.markdown('### Training dataset')
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            calib_period_start = st.date_input('Training data start date',
+                                        value = pd.to_datetime('2022-03-01'),
+                                        min_value=df_txns.date.min().date(),
+                                        max_value=df_traffic.date.max().date(),
+                                        help = tooltips_text['training_start'])
+        with tcol2:
+            calib_period_end = st.date_input('Training data end date',
+                                        value = df_traffic.date.max().date(),
+                                        min_value= calib_period_start + timedelta(days=30),
+                                        max_value= df_traffic.date.max().date(),
+                                        help = tooltips_text['training_end'])
+        if calib_period_start >= calib_period_end:
+            st.error('Train_end should come after train_start.')
         
         # fit pnbd model on all dataset
         # should only run once (st.experimental_memo)
@@ -614,10 +632,10 @@ if __name__ == "__main__":
         temp = df_txns[df_txns[filter_by] == group_selected] \
                                 .sort_values('date', ascending=True).reset_index()
         
-        # generate time series df of only transaction dates
-        sku_list = []
         # date not yet restricted to properly get freq, recency, last_txn, ITT
-        temp_data = get_rfm_2(get_agg_data(temp))
+        temp_data = get_rfm_2(get_agg_data(temp),
+                              start_date = calib_period_start,
+                              end_date = calib_period_end)
         
         # 4. Apply Pareto NBD model on calib and obs data
         # sku_dict[item]['pareto_model'] = fit_models(sku_dict[item]['calib'])
@@ -626,33 +644,21 @@ if __name__ == "__main__":
                                              t = 1, 
                                             df = temp_data)
         
-    with st.sidebar.expander("Training and Forecast Dataset"):
-        st.markdown('### Training dataset')
-        tcol1, tcol2 = st.columns(2)
-        with tcol1:
-            calib_period_start = st.date_input('Training data start date',
-                                        value = pd.to_datetime('2022-03-01'),
-                                        min_value=sku_dict[group_selected].date.min().date(),
-                                        max_value=sku_dict[group_selected].date.max().date()-timedelta(days=30),
-                                        help = tooltips_text['training_start'])
-        with tcol2:
-            calib_period_end = st.date_input('Training data end date',
-                                        value = df_traffic.date.max().date(),
-                                        min_value= calib_period_start + timedelta(days=30),
-                                        max_value= df_traffic.date.max().date(),
-                                        help = tooltips_text['training_end'])
-        if calib_period_start >= calib_period_end:
-            st.error('Train_end should come after train_start.')
+    
         
         if pd.Timestamp(calib_period_start) <= df_traffic.date.max():
             date_series = make_forecast_dataframe(calib_period_start, calib_period_end)
-            param_series =  sku_dict[group_selected][sku_dict[group_selected] \
-                                                     .date.isin(date_series.ds.values)]['total_qty'] \
-                                                     .reset_index()
-            evals = pd.concat([date_series, param_series], axis=1) \
-                                                     .rename(columns={0: 'ds', 
-                                                                      param:'y'}) \
-                                                     .drop('index', axis=1)
+            param_series_ =  sku_dict[group_selected][sku_dict[group_selected] \
+                                                     .date.isin(date_series.ds.values)]['total_qty']
+            
+            # some SKU do not have transactions up to calibrate end date so we need to fill in those values
+            param_series= np.zeros(len(date_series))
+            param_series[:len(param_series_)] = param_series_.values
+                
+            evals = pd.concat([date_series, pd.Series(param_series)], axis=1) \
+                                                        .rename(columns={0: 'y'})
+                                                                      
+                                                     
             # check for NaNs
             if evals.y.isnull().sum() > 0.5*len(evals):
                 st.warning('Evals data contains too many NaN values')
@@ -691,7 +697,7 @@ if __name__ == "__main__":
               'seasonality_mode': 'multiplicative',
               'changepoint_prior_scale': 8.0,
               'n_changepoints' : 30,
-              'cap' : 50.0,
+              'cap' : 30.0,
               }
               }
     
@@ -710,7 +716,7 @@ if __name__ == "__main__":
             cap = st.number_input('Fixed cap value',
                                   min_value = 0.0,
                                   max_value = None,
-                                  value = np.ceil(max(sku_dict[group_selected][param])/500)*500,
+                                  value = np.ceil(max(sku_dict[group_selected][param])/25)*25,
                                   step = 0.01,
                                   help = tooltips_text['cap_value'])
             evals.loc[:, 'cap'] = cap
@@ -1140,17 +1146,27 @@ if __name__ == "__main__":
                 custom_reg_container.empty()
                 
     # OUTLIERS
-    # =====================================================================
+    # =========================================================================
     with st.sidebar.expander('Outliers'):
         remove_outliers = st.checkbox('Remove outliers', value = False,
                                       help = tooltips_text['outliers'])
         if remove_outliers:
-            # option to remove datapoints with value = 0
+            # option to remove datapoints with value < 0
+            remove_NaNs = st.checkbox('Remove NaN datapoints',
+                                       value = False)
+            
             remove_neg = st.checkbox('Remove negative datapoints', 
-                                       value = True)
+                                       value = False)
             if remove_neg:
-                evals = evals.apply(lambda x: x['y'] if x['y'] > 0 else 0, axis=1)
+                evals.loc[:,'y'] = evals.apply(lambda x: x['y'] if x['y'] > 0 else 0, axis=1)
+            if remove_NaNs:
+                evals = evals.fillna(0)
+        else:
+            remove_neg = 0
+            remove_NaNs = 0
     
+    # START FORECAST
+    # =========================================================================
     start_forecast = st.sidebar.checkbox('Launch forecast',
                                  value = False)     
     
