@@ -1091,21 +1091,22 @@ if __name__ == "__main__":
                         future.loc[future.ds.isin(evals.ds), traffic_exog] = df_traffic[df_traffic.date.isin(evals.ds)][traffic_exog].values
                 
                 
-                txns_exogs = st.multiselect('Select transaction data metrics',
-                               options = list(sku_dict[group_selected].columns.drop(labels = ['date', 'total_qty'])),
-                               default = ['ITT_diff', 'expected_purchases'],
-                               help = tooltips_text['add_metrics_select'])
+                # txns_exogs = st.multiselect('Select transaction data metrics',
+                #                options = list(sku_dict[group_selected].columns.drop(labels = ['date', 'total_qty'])),
+                #                default = ['ITT_diff', 'expected_purchases'],
+                #                help = tooltips_text['add_metrics_select'])
                 
-                regressors.extend(txns_exogs)
+                # regressors.extend(txns_exogs)
                 
-                for txns_exog in txns_exogs:
-                    evals.loc[:, txns_exog] = sku_dict[group_selected][sku_dict[group_selected].date.isin(evals.ds)][txns_exog].values
-                    model.add_regressor(txns_exog)
+                # for txns_exog in txns_exogs:
+                #     evals.loc[:, txns_exog] = sku_dict[group_selected][sku_dict[group_selected].date.isin(evals.ds)][txns_exog].values
+                #     model.add_regressor(txns_exog)
                 
                     
-                    # if forecast future
-                    if make_forecast_future:
-                        future.loc[future.ds.isin(evals.ds), txns_exog] = sku_dict[group_selected][sku_dict[group_selected].date.isin(evals.ds)][txns_exog].values
+                #     # if forecast future
+                #     if make_forecast_future:
+                #         future.loc[future.ds.isin(evals.ds), txns_exog] = sku_dict[group_selected][sku_dict[group_selected].date.isin(evals.ds)][txns_exog].values
+        
         
         # gtrends
         add_gtrends = st.checkbox('Add Google trends',
