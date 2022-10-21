@@ -329,8 +329,13 @@ def get_rfm_2(df, start_date = None, end_date = None):
     # ITT
     temp_df['ITT'] = temp_df.apply(lambda x: round(x['recency']/x['freq'], 2) if x['freq'] else 0, 1)
     
+    # ITT_diff
+    temp_df['ITT_diff'] = temp_df['ITT'] - temp_df['last_txn']
+    
     # total_qty
     temp_df['total_qty'] = temp_df.apply(lambda x: df[df.date==x['date']]['total_qty'].values.sum() if x['date'] in df.date.dt.date.array else 0, 1)
+    
+    # has_trans
     temp_df['has_trans'] = temp_df.apply(lambda x: 1 if x['date'] in df.date.dt.date.array else 0, 1)
     temp_df['trans_count'] = temp_df.apply(lambda x: len(df[df.date==x['date']]['total_qty'].values) if x['date'] in df.date.dt.date.array else 0, 1)
     temp_df['avg_qty'] = temp_df.apply(lambda x: temp_df[(temp_df.has_trans==1) & (temp_df.date<=x['date'])]['total_qty'].values.mean() if x['date'] in df.date.dt.date.array else 0, 1)
@@ -399,7 +404,30 @@ def get_agg_data(df):
     agg_data.loc[:, 'freq'] = agg_data.freq.cumsum()
     return agg_data.reset_index()
 
-@st.experimental_singleton
+@st.experimental_memo
+def make_full_dataset(df):
+    temp_list = []
+    for group in select_groups:
+        filtered = df[df[filter_by]==group] \
+                            .sort_values('date', ascending=True).reset_index()
+        filtered_rfm = get_rfm_2(get_agg_data(filtered))
+        temp_list.append(filtered_rfm)
+    
+    full_rfm_dataset = pd.concat(temp_list)
+    
+    trans_dict = {}
+    for group in select_groups:
+        filtered = df[df[filter_by]==group] \
+                            .sort_values('date', ascending=True).reset_index()
+        filtered_rfm = get_rfm_2(get_agg_data(filtered))
+        trans_dict[group]['trans_data'] = lifetimes_stats(_pnbd=pnbd_model,
+                                          t=1,
+                                          df=filtered_rfm)
+    
+    full_train_dataset = pd.concat([trans_dict[grp]['trans_data'].shift(1).dropna() for grp in select_groups])
+    return  full_train_dataset, full_rfm_dataset
+
+@st.experimental_memo
 def xgb_model(data):
     # set X, y datasets for xgboost
     X = data[['recency', 'freq', 'T', 'ITT', 'last_txn']]
@@ -643,27 +671,8 @@ if __name__ == "__main__":
         # Create full timeseries dataset of all viable groups for xgboost fit
         # should only run once (st.experimental_memo)
         
-        temp_list = []
-        for group in select_groups:
-            filtered = df_txns[df_txns[filter_by]==group] \
-                                .sort_values('date', ascending=True).reset_index()
-            filtered_rfm = get_rfm_2(get_agg_data(filtered))
-            temp_list.append(filtered_rfm)
-        
-        full_rfm_dataset = pd.concat(temp_list)
+        full_train_dataset, full_rfm_dataset = make_full_dataset(df_txns)
         pnbd_model = fit_models(full_rfm_dataset)
-        
-        trans_dict = {}
-        for group in select_groups:
-            filtered = df_txns[df_txns[filter_by]==group] \
-                                .sort_values('date', ascending=True).reset_index()
-            filtered_rfm = get_rfm_2(get_agg_data(filtered))
-            pnbd_ = fit_models(filtered_rfm)
-            trans_dict[group] = {'model': pnbd_}
-            trans_dict[group]['trans_data'] = lifetimes_stats(_pnbd=pnbd_model,
-                                              t=1,
-                                              df=filtered_rfm)
-        full_train_dataset = pd.concat([trans_dict[grp]['trans_data'].shift(1).dropna() for grp in select_groups])
         
         # setup and train xgb model
         xgb = xgb_model(full_train_dataset)
@@ -677,7 +686,6 @@ if __name__ == "__main__":
         temp_data = get_rfm_2(get_agg_data(temp), 
                               start_date = calib_period_start,
                               end_date = calib_period_end)
-        #temp_data = temp_data[(temp_data.date.dt.date >= calib_period_start) & (temp_data.date.dt.date <= calib_period_end)]
         
         # 4. Apply Pareto NBD model on calib and obs data
         # sku_dict[item]['pareto_model'] = fit_models(sku_dict[item]['calib'])
@@ -1084,7 +1092,7 @@ if __name__ == "__main__":
                 
                 txns_exogs = st.multiselect('Select transaction data metrics',
                                options = list(sku_dict[group_selected].columns.drop(labels = ['date', 'total_qty'])),
-                               default = list(sku_dict[group_selected].columns.drop(labels = ['date', 'total_qty'])),
+                               default = ['ITT-diff', 'expected_purchases'],
                                help = tooltips_text['add_metrics_select'])
                 
                 regressors.extend(txns_exogs)
