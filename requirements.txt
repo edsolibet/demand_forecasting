@@ -9,4 +9,5 @@ prophet
 requests
 openpyxl
 pytrends
+xgboost
 
