@@ -414,6 +414,7 @@ def make_full_dataset(df, select_groups):
         temp_list.append(filtered_rfm)
     
     full_rfm_dataset = pd.concat(temp_list)
+    pnbd_model = fit_models(full_rfm_dataset)
     
     trans_dict = {}
     for group in select_groups:
