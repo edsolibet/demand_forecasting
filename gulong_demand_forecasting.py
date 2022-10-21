@@ -405,7 +405,7 @@ def get_agg_data(df):
     return agg_data.reset_index()
 
 @st.experimental_memo
-def make_full_dataset(df):
+def make_full_dataset(df, select_groups):
     temp_list = []
     for group in select_groups:
         filtered = df[df[filter_by]==group] \
@@ -420,11 +420,11 @@ def make_full_dataset(df):
         filtered = df[df[filter_by]==group] \
                             .sort_values('date', ascending=True).reset_index()
         filtered_rfm = get_rfm_2(get_agg_data(filtered))
-        trans_dict[group]['trans_data'] = lifetimes_stats(_pnbd=pnbd_model,
+        trans_dict[group] = lifetimes_stats(_pnbd=pnbd_model,
                                           t=1,
                                           df=filtered_rfm)
     
-    full_train_dataset = pd.concat([trans_dict[grp]['trans_data'].shift(1).dropna() for grp in select_groups])
+    full_train_dataset = pd.concat([trans_dict[grp].shift(1).dropna() for grp in select_groups])
     return  full_train_dataset, full_rfm_dataset
 
 @st.experimental_memo
@@ -671,7 +671,7 @@ if __name__ == "__main__":
         # Create full timeseries dataset of all viable groups for xgboost fit
         # should only run once (st.experimental_memo)
         
-        full_train_dataset, full_rfm_dataset = make_full_dataset(df_txns)
+        full_train_dataset, full_rfm_dataset = make_full_dataset(df_txns, select_groups)
         pnbd_model = fit_models(full_rfm_dataset)
         
         # setup and train xgb model
@@ -1092,7 +1092,7 @@ if __name__ == "__main__":
                 
                 txns_exogs = st.multiselect('Select transaction data metrics',
                                options = list(sku_dict[group_selected].columns.drop(labels = ['date', 'total_qty'])),
-                               default = ['ITT-diff', 'expected_purchases'],
+                               default = ['ITT_diff', 'expected_purchases'],
                                help = tooltips_text['add_metrics_select'])
                 
                 regressors.extend(txns_exogs)
