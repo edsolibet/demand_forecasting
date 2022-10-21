@@ -15,6 +15,7 @@ import datetime as dt
 from datetime import timedelta
 import openpyxl, requests, string, re
 from io import BytesIO
+from collections import defaultdict
 
 # streamlit
 import streamlit as st
@@ -32,6 +33,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # Machine Learning libraries
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error, r2_score
 
 
@@ -262,7 +265,7 @@ def get_rfm_2(df, start_date = None, end_date = None):
     # establish start and end dates of temp_df
     start = start_date if start_date is not None else df.date.min()
     end = end_date if end_date is not None else df.date.max()
-    temp_df['date'] = pd.date_range(start = start,
+    temp_df['date'] = pd.date_range(start = df.date.min(),
                                     end = end, freq='D').array
     # frequency
     # cases:
@@ -328,8 +331,11 @@ def get_rfm_2(df, start_date = None, end_date = None):
     
     # total_qty
     temp_df['total_qty'] = temp_df.apply(lambda x: df[df.date==x['date']]['total_qty'].values.sum() if x['date'] in df.date.dt.date.array else 0, 1)
+    temp_df['has_trans'] = temp_df.apply(lambda x: 1 if x['date'] in df.date.dt.date.array else 0, 1)
+    temp_df['trans_count'] = temp_df.apply(lambda x: len(df[df.date==x['date']]['total_qty'].values) if x['date'] in df.date.dt.date.array else 0, 1)
+    temp_df['avg_qty'] = temp_df.apply(lambda x: temp_df[(temp_df.has_trans==1) & (temp_df.date<=x['date'])]['total_qty'].values.mean() if x['date'] in df.date.dt.date.array else 0, 1)
     #temp_df['total_sales'] = temp_df.apply(lambda x: df[df.date==x['date']]['total_sales'].values.sum() if x['date'] in df.date.dt.date.array else 0, 1)
-    return temp_df
+    return temp_df[(temp_df.date.dt.date >= start) & (temp_df.date.dt.date <= end)]
     
 @st.experimental_singleton
 def fit_models(df, penalizer = 0.001):
@@ -370,6 +376,7 @@ def lifetimes_stats(_pnbd, t, df):
     df.loc[:,'prob_active'] = df.apply(lambda x: _pnbd.conditional_probability_alive(x['freq'], x['recency'], x['T'])*100, 1)
     df.loc[:, 'expected_purchases'] = df.apply(lambda x: 
             _pnbd.conditional_expected_number_of_purchases_up_to_time(t, x['freq'], x['recency'], x['T']),1)
+    df.loc[:, 'expected_qty'] = df.loc[:, 'expected_purchases'] * df.loc[:, 'avg_qty']
     return df
 
 
@@ -391,6 +398,17 @@ def get_agg_data(df):
                                   total_sales = ('cost', sum))
     agg_data.loc[:, 'freq'] = agg_data.freq.cumsum()
     return agg_data.reset_index()
+
+@st.experimental_singleton
+def xgb_model(data):
+    # set X, y datasets for xgboost
+    X = data[['recency', 'freq', 'T', 'ITT', 'last_txn']]
+    y = data.has_trans.astype('category')
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=101)
+    xgb = XGBClassifier(n_estimators = 100, max_depth = 10, n_jobs=3, random_state=101)
+    xgb.fit(X_train, y_train)
+    return xgb
 
 def make_forecast_dataframe(start, end):
     '''
@@ -535,6 +553,8 @@ def remove_neg_val(val):
     val = val if val > 0 else 0
     return val
 
+def update_slider(value):
+    st.session_state['reg_prior_scale'] = value
 
 if __name__ == "__main__":
     # 1. import datasets
@@ -576,6 +596,7 @@ if __name__ == "__main__":
                         help = tooltips_text['min_num_trans'])
         
         # Transaction date cutoff
+        # 2022-03-01 default value due to traffic values
         max_date = st.date_input(label = "Last transaction date cutoff",
                                  min_value = df_txns['date'].min().date(),
                                  value = pd.to_datetime('2022-03-01'),
@@ -619,21 +640,44 @@ if __name__ == "__main__":
         if calib_period_start >= calib_period_end:
             st.error('Train_end should come after train_start.')
         
-        # fit pnbd model on all dataset
+        # Create full timeseries dataset of all viable groups for xgboost fit
         # should only run once (st.experimental_memo)
-        pnbd_model = fit_models(get_rfm_2(get_agg_data(df_txns)))
         
-        # 3. Create RFM dataframe
-        # Use all filtered data for fitting pareto model
-        sku_dict = {}
-        # groupby date + calc agg data + pareto results
-        temp = df_txns[df_txns[filter_by] == group_selected] \
+        temp_list = []
+        for group in select_groups:
+            filtered = df_txns[df_txns[filter_by]==group] \
                                 .sort_values('date', ascending=True).reset_index()
+            filtered_rfm = get_rfm_2(get_agg_data(filtered))
+            temp_list.append(filtered_rfm)
         
-        # date not yet restricted to properly get freq, recency, last_txn, ITT
-        temp_data = get_rfm_2(get_agg_data(temp),
+        full_rfm_dataset = pd.concat(temp_list)
+        pnbd_model = fit_models(full_rfm_dataset)
+        
+        trans_dict = {}
+        for group in select_groups:
+            filtered = df_txns[df_txns[filter_by]==group] \
+                                .sort_values('date', ascending=True).reset_index()
+            filtered_rfm = get_rfm_2(get_agg_data(filtered))
+            pnbd_ = fit_models(filtered_rfm)
+            trans_dict[group] = {'model': pnbd_}
+            trans_dict[group]['trans_data'] = lifetimes_stats(_pnbd=pnbd_model,
+                                              t=1,
+                                              df=filtered_rfm)
+        full_train_dataset = pd.concat([trans_dict[grp]['trans_data'].shift(1).dropna() for grp in select_groups])
+        
+        # setup and train xgb model
+        xgb = xgb_model(full_train_dataset)
+        
+        
+        # 3. Create RFM dataframe of selected group
+        sku_dict = {}
+        temp = df_txns[df_txns[filter_by] == group_selected] \
+                                .sort_values('date', ascending=False).reset_index()
+        
+        temp_data = get_rfm_2(get_agg_data(temp), 
                               start_date = calib_period_start,
                               end_date = calib_period_end)
+        #temp_data = temp_data[(temp_data.date.dt.date >= calib_period_start) & (temp_data.date.dt.date <= calib_period_end)]
         
         # 4. Apply Pareto NBD model on calib and obs data
         # sku_dict[item]['pareto_model'] = fit_models(sku_dict[item]['calib'])
@@ -642,7 +686,6 @@ if __name__ == "__main__":
                                              t = 1, 
                                             df = temp_data)
         
-    
         
         if pd.Timestamp(calib_period_start) <= df_traffic.date.max():
             date_series = make_forecast_dataframe(calib_period_start, calib_period_end)
@@ -679,8 +722,17 @@ if __name__ == "__main__":
                                                help = tooltips_text['forecast_horizon'])
             
             forecast_horizon = (forecast_end - calib_period_end).days + 1
-            future = make_forecast_dataframe(start=calib_period_start, 
+            _future = make_forecast_dataframe(start=calib_period_start, 
                                              end=forecast_end)
+            future_temp_data = get_rfm_2(get_agg_data(temp),
+                              start_date = calib_period_start,
+                              end_date = forecast_end)
+            
+            future = lifetimes_stats(_pnbd = pnbd_model, 
+                                              t = 1, 
+                                              df = future_temp_data)\
+                                    .rename(columns={'date':'ds'})
+            
             st.info(f'''Forecast dates:\n 
                     {calib_period_end+timedelta(days=1)} to {forecast_end}''')
         
@@ -952,7 +1004,7 @@ if __name__ == "__main__":
             holiday_scale = st.number_input('holiday_prior_scale',
                                             min_value = 1.0,
                                             max_value = 30.0,
-                                            value = float(3),
+                                            value = 3.0,
                                             step = 1.0,
                                             help = tooltips_text['holiday_prior_scale'])
             # set holiday prior scale
@@ -961,7 +1013,8 @@ if __name__ == "__main__":
         else:
             # no holiday effects
             model.holidays = None
-            model.holiday_prior_scale = 0
+            holiday_scale = 3.0
+            model.holiday_prior_scale = holiday_scale
     
     # REGRESSORS
     # =========================================================================
@@ -1077,6 +1130,7 @@ if __name__ == "__main__":
             regressor_input = st.empty()
             if add_metrics and len(regressors) > 0:
                 # provide input field
+                regressor_prior_scale = defaultdict(lambda: holiday_scale)
                 with regressor_input.container():
                     for regressor in regressors:
                         if regressor in df_traffic.columns:
@@ -1086,33 +1140,44 @@ if __name__ == "__main__":
                         if add_gtrends and len(kw_list) > 0:
                             exog_data = gtrends[regressor]
                         # added key to solve DuplicateWidgetID
-                        data_input = st.selectbox(regressor + ' data input type:',
-                                             options=['total', 'average'],
-                                             index=1,
-                                             key = regressor + '_input',
-                                             help = tooltips_text['data_input_type'])
                         
-                        if data_input == 'total':
-                            # if data input is total
-                            total = st.number_input('Select {} total over forecast period'.format(regressor),
-                                                   min_value = 0.0, 
-                                                   value = float(np.nansum(exog_data[-int(forecast_horizon):])),
-                                                   step = 0.01,
-                                                   help = tooltips_text['data_input_total'])
-                            future.loc[future.index[-int(forecast_horizon):],regressor] = np.full((int(forecast_horizon),), round(total/forecast_horizon, 3))
-                        else:
-                            # if data input is average
-                            average = st.number_input('Select {} average over forecast period'.format(regressor),
-                                                   min_value = 0.00, 
-                                                   value = np.nanmean(exog_data[-int(forecast_horizon):]),
-                                                   step = 0.010,
-                                                   help = tooltips_text['data_input_average'])
-                            future.loc[future.index[-int(forecast_horizon):],regressor] = np.full((int(forecast_horizon),), round(average, 3))
+                        col_input, col_val = st.columns(2)
+                        with col_input:
+                            data_input = st.selectbox(regressor + ' data input type:',
+                                                 options=['total', 'average'],
+                                                 index=1,
+                                                 key = regressor + '_input',
+                                                 help = tooltips_text['data_input_type'])
+                        
+                        with col_val:
+                            if data_input == 'total':
+                                # if data input is total
+                                total = st.number_input('{} total'.format(regressor),
+                                                       min_value = 0.0, 
+                                                       value = float(np.nansum(exog_data[-int(forecast_horizon):])),
+                                                       step = 0.01,
+                                                       help = tooltips_text['data_input_total'])
+                                future.loc[future.index[-int(forecast_horizon):],regressor] = np.full((int(forecast_horizon),), round(total/forecast_horizon, 3))
+                            else:
+                                # if data input is average
+                                average = st.number_input('{} average'.format(regressor),
+                                                       min_value = 0.00, 
+                                                       value = np.nanmean(exog_data[-int(forecast_horizon):]),
+                                                       step = 0.010,
+                                                       help = tooltips_text['data_input_average'])
+                                future.loc[future.index[-int(forecast_horizon):],regressor] = np.full((int(forecast_horizon),), round(average, 3))
+            
+                        reg_prior_scale = st.slider('Input {} prior scale'.format(regressor),
+                                                      min_value = 0.0,
+                                                      max_value = 20.0,
+                                                      value = holiday_scale,
+                                                      step = 0.5)
+                        regressor_prior_scale[regressor] = reg_prior_scale
+                        
+            
             else:
                 # delete unused fields
                 regressor_input.empty()
-            
-            
             
             # custom regressors (functions applied to dates)
             add_custom_reg = st.checkbox('Add custom regressors',
@@ -1136,7 +1201,7 @@ if __name__ == "__main__":
                     
                     for reg in regs_list:
                         evals.loc[:, reg] = regs[reg].values
-                        model.add_regressor(reg)
+                        model.add_regressor(reg, prior_scale = regressor_prior_scale[reg])
                     
                         if make_forecast_future:
                             future.loc[:, reg] = regs_future[reg].values
